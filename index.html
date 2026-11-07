@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="WordFlip — минималистичные флэш-карточки для изучения английских и русских слов. Работает офлайн, данные хранятся в браузере.">
+  <meta name="theme-color" content="#5b5bd6">
+  <title>WordFlip — карточки для изучения слов</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%235b5bd6'/%3E%3Cstop offset='1' stop-color='%23a855f7'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Crect x='19' y='18' width='20' height='28' rx='5' fill='%23ffffff' opacity='.65' transform='rotate(-8 29 32)'/%3E%3Crect x='27' y='16' width='20' height='28' rx='5' fill='%23ffffff' transform='rotate(8 37 30)'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand__mark" aria-hidden="true"><span></span><span></span></div>
+        <div class="brand__text">
+          <span class="brand__title">WordFlip</span>
+          <span class="brand__subtitle">карточки для слов</span>
+        </div>
+      </div>
+
+      <div class="mode-switch" role="group" aria-label="Язык карточек">
+        <button type="button" data-mode="en" aria-pressed="true">English</button>
+        <button type="button" data-mode="ru" aria-pressed="false">Русский</button>
+      </div>
+
+      <div class="header-actions">
+        <button id="theme-toggle" class="icon-btn" type="button" aria-label="Сменить тему" title="Сменить тему">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <circle cx="12" cy="12" r="8.5"></circle>
+            <path d="M12 3.5a8.5 8.5 0 0 0 0 17z" fill="currentColor" stroke="none"></path>
+          </svg>
+        </button>
+        <button id="sync-open" class="icon-btn sync-btn" type="button" aria-label="Синхронизация с GitHub" title="Синхронизация с GitHub">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M17.5 18.5a4.5 4.5 0 0 0 .6-8.96A6 6 0 0 0 6.3 8.9 4.5 4.5 0 0 0 7 18.5"></path>
+            <path d="M12 20.5v-7"></path>
+            <path d="m9.3 16 2.7-2.7 2.7 2.7"></path>
+          </svg>
+          <span class="sync-dot" data-state="off" aria-hidden="true"></span>
+        </button>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="panel composer" aria-labelledby="composer-title">
+        <div class="composer__head">
+          <h2 id="composer-title">Добавить слово</h2>
+          <p>Язык определяется автоматически по вводу</p>
+        </div>
+        <form id="add-form" class="composer__form" autocomplete="off" novalidate>
+          <div class="field">
+            <label for="word-input">Слово / Word</label>
+            <input id="word-input" name="word" type="text" placeholder="apple или яблоко" maxlength="80" required>
+          </div>
+          <div class="field">
+            <label for="translation-input">Перевод / Translation</label>
+            <input id="translation-input" name="translation" type="text" placeholder="яблоко или apple" maxlength="80" required>
+          </div>
+          <button class="btn btn--primary composer__submit" type="submit">Добавить</button>
+          <div id="detect-badge" class="detect-badge" hidden></div>
+        </form>
+      </section>
+
+      <section class="toolbar" aria-label="Поиск и импорт">
+        <div class="search">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="7"></circle>
+            <path d="m20 20-3.6-3.6"></path>
+          </svg>
+          <input id="search-input" type="search" placeholder="Поиск по словам и переводам…" aria-label="Поиск по словам и переводам" autocomplete="off">
+          <button id="search-clear" class="search__clear" type="button" aria-label="Очистить поиск" hidden>&times;</button>
+        </div>
+        <div class="toolbar__actions">
+          <button id="import-open" class="btn" type="button">Импорт из буфера</button>
+          <button id="export-btn" class="btn btn--ghost" type="button">Экспорт</button>
+          <button id="import-json-btn" class="btn btn--ghost" type="button">Импорт JSON</button>
+          <input id="json-input" type="file" accept="application/json,.json" hidden>
+        </div>
+      </section>
+
+      <div class="list-head">
+        <p id="stats" class="stats" aria-live="polite">Загрузка…</p>
+        <p class="list-head__hint">Нажмите на карточку, чтобы увидеть перевод</p>
+      </div>
+
+      <section id="cards" class="cards" aria-label="Карточки слов"></section>
+
+      <div id="empty-state" class="empty" hidden>
+        <div class="empty__icon" aria-hidden="true">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+            <rect x="3" y="3" width="13" height="13" rx="3"></rect>
+            <path d="M8 21h10a3 3 0 0 0 3-3V8"></path>
+          </svg>
+        </div>
+        <h3 id="empty-title">Пока пусто</h3>
+        <p id="empty-text">Добавьте первое слово или импортируйте готовый список.</p>
+        <button id="empty-action" class="btn btn--primary" type="button">Добавить слово</button>
+      </div>
+    </main>
+
+    <footer class="app-footer">
+      <p>Данные хранятся локально в этом браузере. Для переноса на другое устройство используйте экспорт/импорт JSON или синхронизацию с GitHub Gist.</p>
+    </footer>
+  </div>
+
+  <dialog id="import-dialog" class="modal" aria-labelledby="import-title">
+    <div class="modal__inner">
+      <header class="modal__head">
+        <div>
+          <h2 id="import-title">Импорт из буфера</h2>
+          <p id="import-subtitle" class="modal__subtitle">Вставьте слова — по одному в строке</p>
+        </div>
+        <button class="icon-btn modal__close" type="button" data-close aria-label="Закрыть">&times;</button>
+      </header>
+
+      <div class="modal__body">
+        <div id="import-step-paste" class="import-step">
+          <label class="sr-only" for="import-text">Слова для импорта</label>
+          <textarea id="import-text" rows="9" placeholder="apple&#10;journey&#10;яблоко&#10;butterfly — бабочка&#10;knowledge: знание"></textarea>
+          <p class="field-hint">Каждое слово с новой строки. Перевод можно указать сразу через «—», «:» или табуляцию — тогда он подставится автоматически.</p>
+        </div>
+
+        <div id="import-step-fill" class="import-step" hidden>
+          <div class="import-progress">
+            <span id="import-count">Заполнено 0 из 0</span>
+            <div class="progress" role="progressbar" aria-label="Заполнение переводов" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span id="import-progress-bar"></span>
+            </div>
+          </div>
+          <div id="import-list" class="import-list"></div>
+        </div>
+      </div>
+
+      <footer class="modal__foot">
+        <button id="import-cancel" class="btn btn--ghost" type="button" data-close>Отмена</button>
+        <button id="import-back" class="btn btn--ghost" type="button" hidden>Назад</button>
+        <button id="import-parse" class="btn btn--primary" type="button">Разобрать</button>
+        <button id="import-save" class="btn btn--primary" type="button" hidden disabled>Сохранить</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <dialog id="sync-dialog" class="modal modal--sync" aria-labelledby="sync-title">
+    <div class="modal__inner">
+      <header class="modal__head">
+        <div>
+          <h2 id="sync-title">Синхронизация с GitHub</h2>
+          <p class="modal__subtitle">Бесплатно, через секретный Gist</p>
+        </div>
+        <button class="icon-btn modal__close" type="button" data-close aria-label="Закрыть">&times;</button>
+      </header>
+
+      <div class="modal__body">
+        <p class="sync-intro">GitHub Pages — статический хостинг, поэтому слова не могут храниться на нём напрямую. Зато приложение умеет сохранять их в <strong>секретный gist</strong> вашего GitHub-аккаунта. Это бесплатно и работает на любом устройстве.</p>
+
+        <ol class="sync-steps">
+          <li>Создайте <a href="https://github.com/settings/tokens/new?scopes=gist&amp;description=WordFlip" target="_blank" rel="noopener">personal access token</a> с галочкой <code>gist</code>.</li>
+          <li>Вставьте токен ниже. Нажмите «Создать новый gist» на первом устройстве.</li>
+          <li>На другом устройстве вставьте токен и ID gist, затем нажмите «Скачать с GitHub».</li>
+        </ol>
+
+        <div class="field">
+          <label for="sync-token">GitHub token (scope <code>gist</code>)</label>
+          <input id="sync-token" type="password" autocomplete="off" spellcheck="false" placeholder="ghp_…">
+        </div>
+        <div class="field">
+          <label for="sync-gist">Gist ID или ссылка</label>
+          <input id="sync-gist" type="text" autocomplete="off" spellcheck="false" placeholder="например, aa5a315d61ae9438b18d">
+        </div>
+
+        <p class="sync-security">Токен хранится только в localStorage этого браузера и отправляется только на api.github.com. Не используйте общий компьютер. При одновременном редактировании на двух устройствах побеждает последняя сохранённая версия.</p>
+        <p id="sync-status" class="sync-status">Синхронизация отключена</p>
+
+        <div class="sync-actions">
+          <button id="sync-create" class="btn" type="button">Создать новый gist</button>
+          <button id="sync-pull" class="btn" type="button">Скачать с GitHub</button>
+          <button id="sync-push" class="btn btn--primary" type="button">Загрузить на GitHub</button>
+        </div>
+      </div>
+
+      <footer class="modal__foot">
+        <button id="sync-disable" class="btn btn--danger-ghost" type="button">Отключить</button>
+        <button class="btn btn--ghost" type="button" data-close>Закрыть</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="script.js"></script>
+</body>
+</html>
