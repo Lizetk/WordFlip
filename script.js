@@ -14,14 +14,6 @@
   const GIST_API = "https://api.github.com";
 
   const DEMO_WORDS = [
-    { english: "apple", russian: "яблоко" },
-    { english: "journey", russian: "путешествие" },
-    { english: "butterfly", russian: "бабочка" },
-    { english: "knowledge", russian: "знание" },
-    { english: "friend", russian: "друг" },
-    { english: "window", russian: "окно" },
-    { english: "sunflower", russian: "подсолнух" },
-    { english: "quiet", russian: "тихий" },
     { english: "dream", russian: "мечта" },
     { english: "courage", russian: "смелость" }
   ];
@@ -31,7 +23,14 @@
     mode: "en",
     theme: "auto",
     query: "",
+    view: "cards",
     flipped: new Set(),
+    review: {
+      started: false,
+      queue: [],
+      learned: new Set(),
+      flipped: false
+    },
     pendingImport: [],
     importStep: 1,
     sync: {
@@ -61,6 +60,7 @@
     bindEvents();
     applyTheme();
     renderMode();
+    renderViews();
     updateDetection();
     render();
     updateSyncStatus();
@@ -324,10 +324,27 @@
       searchClear: document.getElementById("search-clear"),
       stats: document.getElementById("stats"),
       cards: document.getElementById("cards"),
+      shuffleBtn: document.getElementById("shuffle-btn"),
       emptyState: document.getElementById("empty-state"),
       emptyTitle: document.getElementById("empty-title"),
       emptyText: document.getElementById("empty-text"),
       emptyAction: document.getElementById("empty-action"),
+
+      viewTabs: Array.prototype.slice.call(
+        document.querySelectorAll(".view-switch__tab")
+      ),
+      viewCards: document.getElementById("view-cards"),
+      viewReview: document.getElementById("view-review"),
+      reviewBadge: document.getElementById("review-badge"),
+      reviewBar: document.getElementById("review-bar"),
+      reviewStage: document.getElementById("review-stage"),
+      reviewEmpty: document.getElementById("review-empty"),
+      reviewEmptyAction: document.getElementById("review-empty-action"),
+      reviewCount: document.getElementById("review-count"),
+      reviewRemaining: document.getElementById("review-remaining"),
+      reviewProgress: document.getElementById("review-progress"),
+      reviewProgressBar: document.getElementById("review-progress-bar"),
+      reviewRestart: document.getElementById("review-restart"),
 
       importOpen: document.getElementById("import-open"),
       exportBtn: document.getElementById("export-btn"),
@@ -365,6 +382,25 @@
       button.addEventListener("click", function () {
         setMode(button.dataset.mode);
       });
+    });
+
+    els.viewTabs.forEach(function (button) {
+      button.addEventListener("click", function () {
+        setView(button.dataset.view);
+      });
+    });
+    document
+      .querySelector(".view-switch")
+      .addEventListener("keydown", handleViewTabsKeydown);
+
+    els.shuffleBtn.addEventListener("click", shuffleDeck);
+    els.reviewRestart.addEventListener("click", restartReview);
+    els.reviewStage.addEventListener("click", handleReviewStageClick);
+    els.reviewStage.addEventListener("keydown", handleReviewStageKeydown);
+    els.reviewEmptyAction.addEventListener("click", function () {
+      setView("cards");
+      els.wordInput.focus();
+      els.wordInput.scrollIntoView({ behavior: "smooth", block: "center" });
     });
 
     els.themeToggle.addEventListener("click", cycleTheme);
@@ -473,6 +509,7 @@
     }
     state.mode = mode;
     state.flipped.clear();
+    state.review.flipped = false;
     saveSettings();
     renderMode();
     render();
@@ -518,6 +555,480 @@
     if (themeColor) {
       themeColor.setAttribute("content", isDark ? "#0a0c13" : "#f4f5fa");
     }
+  }
+
+  /* ==========================================================
+     Views, shuffle and review session
+     ========================================================== */
+
+  function renderViews() {
+    const isReview = state.view === "review";
+
+    els.viewCards.hidden = isReview;
+    els.viewReview.hidden = !isReview;
+
+    els.viewTabs.forEach(function (button) {
+      const selected = button.dataset.view === state.view;
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+    });
+  }
+
+  function setView(view) {
+    if (view !== "cards" && view !== "review") {
+      return;
+    }
+    state.view = view;
+    renderViews();
+
+    if (view === "review") {
+      ensureReviewStarted();
+      reconcileReview();
+      renderReview();
+    }
+  }
+
+  function handleViewTabsKeydown(event) {
+    const keys = ["ArrowLeft", "ArrowRight", "Home", "End"];
+    if (keys.indexOf(event.key) === -1) {
+      return;
+    }
+
+    const tabs = els.viewTabs;
+    const current = tabs.indexOf(document.activeElement);
+    if (current === -1) {
+      return;
+    }
+
+    event.preventDefault();
+    let next = current;
+    if (event.key === "ArrowRight") {
+      next = (current + 1) % tabs.length;
+    } else if (event.key === "ArrowLeft") {
+      next = (current - 1 + tabs.length) % tabs.length;
+    } else if (event.key === "Home") {
+      next = 0;
+    } else {
+      next = tabs.length - 1;
+    }
+
+    setView(tabs[next].dataset.view);
+    tabs[next].focus();
+  }
+
+  function shuffleArray(list) {
+    const result = list.slice();
+    for (let index = result.length - 1; index > 0; index -= 1) {
+      const randomIndex = Math.floor(Math.random() * (index + 1));
+      const temporary = result[index];
+      result[index] = result[randomIndex];
+      result[randomIndex] = temporary;
+    }
+    return result;
+  }
+
+  function shuffleDeck() {
+    if (state.words.length < 2) {
+      toast("Недостаточно карточек для перемешивания", "info");
+      return;
+    }
+
+    state.words = shuffleArray(state.words);
+    state.flipped.clear();
+    persistWords();
+    render();
+    toast("Карточки перемешаны", "info");
+  }
+
+  function ensureReviewStarted() {
+    if (state.review.started) {
+      return;
+    }
+
+    const deckIds = state.words.map(function (word) {
+      return word.id;
+    });
+    const queue = shuffleArray(deckIds);
+
+    // Страховка: очередь повторения не должна совпадать с порядком колоды,
+    // даже если случайное перемешивание вернуло исходный порядок.
+    const deckOrder =
+      queue.length === deckIds.length &&
+      queue.every(function (id, index) {
+        return id === deckIds[index];
+      });
+    if (deckOrder && queue.length > 1) {
+      queue.push(queue.shift());
+    }
+
+    state.review.started = true;
+    state.review.queue = queue;
+    state.review.learned = new Set();
+    state.review.flipped = false;
+  }
+
+  function reconcileReview() {
+    const review = state.review;
+    if (!review.started) {
+      return;
+    }
+
+    const deckIds = state.words.map(function (word) {
+      return word.id;
+    });
+    const deckSet = new Set(deckIds);
+    const queued = new Set(review.queue);
+
+    const filtered = review.queue.filter(function (id) {
+      return deckSet.has(id);
+    });
+    if (filtered.length !== review.queue.length) {
+      review.queue = filtered;
+    }
+
+    Array.from(review.learned).forEach(function (id) {
+      if (!deckSet.has(id)) {
+        review.learned.delete(id);
+      }
+    });
+
+    const additions = deckIds.filter(function (id) {
+      return !queued.has(id);
+    });
+    if (additions.length) {
+      // Новые слова (например, после загрузки с GitHub) встают в конец
+      // невыученных, но до первой выученной карточки и в случайном порядке.
+      const boundary = review.queue.findIndex(function (id) {
+        return review.learned.has(id);
+      });
+      const insertAt = boundary === -1 ? review.queue.length : boundary;
+      review.queue.splice.apply(
+        review.queue,
+        [insertAt, 0].concat(shuffleArray(additions))
+      );
+    }
+  }
+
+  function updateReviewBadge() {
+    if (!els.reviewBadge) {
+      return;
+    }
+
+    const remaining = state.review.started
+      ? Math.max(0, state.review.queue.length - state.review.learned.size)
+      : 0;
+
+    if (state.review.started && remaining > 0) {
+      els.reviewBadge.hidden = false;
+      els.reviewBadge.textContent = String(remaining);
+    } else {
+      els.reviewBadge.hidden = true;
+      els.reviewBadge.textContent = "";
+    }
+  }
+
+  function renderReview(options) {
+    const opts = options || {};
+    ensureReviewStarted();
+
+    const total = state.review.queue.length;
+    const learned = state.review.learned.size;
+    const remaining = Math.max(0, total - learned);
+    const percent = total ? Math.round((learned / total) * 100) : 0;
+
+    els.reviewCount.textContent = "Выучено: " + learned + " из " + total;
+    els.reviewRemaining.textContent = remaining
+      ? "Осталось: " + remaining + " " + wordPlural(remaining)
+      : "Готово";
+    els.reviewProgressBar.style.width = percent + "%";
+    els.reviewProgress.setAttribute("aria-valuenow", String(percent));
+
+    if (!state.words.length) {
+      els.reviewBar.hidden = true;
+      els.reviewStage.hidden = true;
+      els.reviewStage.replaceChildren();
+      els.reviewEmpty.hidden = false;
+      updateReviewBadge();
+      return;
+    }
+
+    els.reviewEmpty.hidden = true;
+    els.reviewBar.hidden = false;
+    els.reviewStage.hidden = false;
+
+    if (!remaining) {
+      renderReviewDone(total);
+      if (opts.focus) {
+        const restart = els.reviewStage.querySelector(
+          '[data-review-action="restart"]'
+        );
+        if (restart) {
+          restart.focus({ preventScroll: true });
+        }
+      }
+    } else {
+      renderReviewCard();
+      if (opts.focus) {
+        const card = els.reviewStage.querySelector(".card--review");
+        if (card) {
+          card.focus({ preventScroll: true });
+        }
+      }
+    }
+
+    updateReviewBadge();
+  }
+
+  function renderReviewCard() {
+    const id = state.review.queue[0];
+    const word = state.words.find(function (item) {
+      return item.id === id;
+    });
+
+    if (!word) {
+      state.review.queue.shift();
+      renderReview();
+      return;
+    }
+
+    const promptLang = state.mode;
+    const answerLang = state.mode === "en" ? "ru" : "en";
+    const prompt = promptLang === "en" ? word.english : word.russian;
+    const answer = answerLang === "en" ? word.english : word.russian;
+    const isFlipped = state.review.flipped;
+
+    const card = document.createElement("article");
+    card.className = "card card--review" + (isFlipped ? " is-flipped" : "");
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-pressed", String(isFlipped));
+    card.setAttribute(
+      "aria-label",
+      prompt + ". " + (isFlipped ? "Перевод показан" : "Показать перевод")
+    );
+
+    const inner = document.createElement("div");
+    inner.className = "card__inner";
+
+    const front = createCardFace(
+      "front",
+      promptLang.toUpperCase(),
+      prompt,
+      "Нажмите, чтобы увидеть перевод"
+    );
+    const back = createCardFace(
+      "back",
+      answerLang.toUpperCase(),
+      answer,
+      "Нажмите, чтобы скрыть перевод"
+    );
+
+    front.setAttribute("aria-hidden", String(isFlipped));
+    back.setAttribute("aria-hidden", String(!isFlipped));
+
+    inner.append(front, back);
+    card.append(inner);
+
+    const cardWrap = document.createElement("div");
+    cardWrap.className = "review-card";
+    cardWrap.append(card);
+
+    const actions = document.createElement("div");
+    actions.className = "review-actions";
+    actions.hidden = !isFlipped;
+    actions.append(createReviewButton("forgot"), createReviewButton("known"));
+
+    els.reviewStage.replaceChildren(cardWrap, actions);
+  }
+
+  function createReviewButton(kind) {
+    const known = kind === "known";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className =
+      "btn review-action " +
+      (known ? "review-action--known" : "review-action--forgot");
+    button.dataset.reviewAction = kind;
+    button.setAttribute("aria-label", known ? "Знаю" : "Не знаю / Забыл");
+
+    const icon = document.createElement("span");
+    icon.className = "review-action__icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = known ? "✓" : "✕";
+
+    const label = document.createElement("span");
+    label.textContent = known ? "Знаю" : "Не знаю";
+
+    button.append(icon, label);
+    return button;
+  }
+
+  function renderReviewDone(total) {
+    const panel = document.createElement("div");
+    panel.className = "review-done";
+    panel.setAttribute("role", "status");
+
+    const icon = document.createElement("div");
+    icon.className = "review-done__icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "✓";
+
+    const title = document.createElement("h2");
+    title.textContent = "Все слова повторены!";
+
+    const text = document.createElement("p");
+    text.textContent = total
+      ? "Выучено " +
+        total +
+        " " +
+        wordPlural(total) +
+        ". Отличная работа — можно пройти колоду ещё раз."
+      : "Добавьте слова, чтобы начать повторение.";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn btn--primary";
+    button.dataset.reviewAction = "restart";
+    button.textContent = "Перезапуск";
+
+    panel.append(icon, title, text, button);
+    els.reviewStage.replaceChildren(panel);
+  }
+
+  function toggleReviewFlip() {
+    const card = els.reviewStage.querySelector(".card--review");
+    if (!card) {
+      return;
+    }
+
+    const isFlipped = !state.review.flipped;
+    state.review.flipped = isFlipped;
+
+    card.classList.toggle("is-flipped", isFlipped);
+    card.setAttribute("aria-pressed", String(isFlipped));
+
+    const front = card.querySelector(".card__face--front");
+    const back = card.querySelector(".card__face--back");
+    if (front) {
+      front.setAttribute("aria-hidden", String(isFlipped));
+    }
+    if (back) {
+      back.setAttribute("aria-hidden", String(!isFlipped));
+    }
+
+    const word = state.words.find(function (item) {
+      return item.id === state.review.queue[0];
+    });
+    if (word) {
+      const prompt = state.mode === "en" ? word.english : word.russian;
+      card.setAttribute(
+        "aria-label",
+        prompt + ". " + (isFlipped ? "Перевод показан" : "Показать перевод")
+      );
+    }
+
+    const actions = els.reviewStage.querySelector(".review-actions");
+    if (actions) {
+      actions.hidden = !isFlipped;
+    }
+  }
+
+  function handleReviewStageClick(event) {
+    const action = event.target.closest("[data-review-action]");
+    if (action) {
+      const value = action.dataset.reviewAction;
+      if (value === "known") {
+        answerReview(true);
+      } else if (value === "forgot") {
+        answerReview(false);
+      } else if (value === "restart") {
+        restartReview();
+      }
+      return;
+    }
+
+    if (event.target.closest(".card--review")) {
+      toggleReviewFlip();
+    }
+  }
+
+  function handleReviewStageKeydown(event) {
+    if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") {
+      return;
+    }
+    if (event.target.closest("[data-review-action]")) {
+      return;
+    }
+
+    const card = event.target.closest(".card--review");
+    if (!card) {
+      return;
+    }
+
+    event.preventDefault();
+    toggleReviewFlip();
+  }
+
+  function answerReview(known) {
+    const review = state.review;
+    if (!review.started || !review.queue.length) {
+      return;
+    }
+
+    const id = review.queue.shift();
+    if (!id) {
+      return;
+    }
+
+    if (known) {
+      review.learned.add(id);
+      review.queue.push(id);
+    } else {
+      review.learned.delete(id);
+      // Первая выученная карточка — граница, за которую нельзя вставлять.
+      const boundary = review.queue.findIndex(function (item) {
+        return review.learned.has(item);
+      });
+      const unlearned = boundary === -1 ? review.queue.length : boundary;
+      review.queue.splice(pickReinsertionIndex(unlearned), 0, id);
+    }
+
+    review.flipped = false;
+    renderReview({ focus: true });
+  }
+
+  function pickReinsertionIndex(unlearnedCount) {
+    if (unlearnedCount <= 0) {
+      return 0;
+    }
+
+    // Мало невыученных — выбираем позицию внутри всего оставшегося отрезка.
+    if (unlearnedCount < 30) {
+      return 1 + Math.floor(Math.random() * unlearnedCount);
+    }
+
+    // Иначе возвращаем карточку на 10–30-е место, но до первой выученной.
+    return 9 + Math.floor(Math.random() * 21);
+  }
+
+  function restartReview() {
+    state.review.started = true;
+    state.review.queue = shuffleArray(
+      state.words.map(function (word) {
+        return word.id;
+      })
+    );
+    state.review.learned = new Set();
+    state.review.flipped = false;
+
+    if (!state.words.length) {
+      renderReview();
+      return;
+    }
+
+    renderReview({ focus: true });
+    toast("Колода перемешана — начинаем заново", "info");
   }
 
   /* ==========================================================
@@ -669,6 +1180,13 @@
     renderStats(results.length);
     renderEmptyState(results);
     els.searchClear.hidden = !state.query;
+    els.shuffleBtn.disabled = state.words.length < 2;
+    reconcileReview();
+    updateReviewBadge();
+
+    if (state.view === "review") {
+      renderReview();
+    }
   }
 
   function renderCards(results) {
