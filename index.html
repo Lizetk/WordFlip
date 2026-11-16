@@ -50,6 +50,10 @@
           Повторение
           <span id="review-badge" class="view-switch__badge" hidden aria-hidden="true"></span>
         </button>
+        <button id="view-tab-schedule" class="view-switch__tab" type="button" role="tab" data-view="schedule" aria-selected="false" aria-controls="view-schedule" tabindex="-1">
+          Расписание
+          <span id="schedule-badge" class="view-switch__badge" hidden aria-hidden="true"></span>
+        </button>
       </div>
 
       <div id="view-cards" class="view" role="tabpanel" aria-labelledby="view-tab-cards">
@@ -154,10 +158,69 @@
           <button id="review-empty-action" class="btn btn--primary" type="button">Перейти к карточкам</button>
         </div>
       </section>
+
+      <section id="view-schedule" class="view review" role="tabpanel" aria-labelledby="view-tab-schedule" hidden>
+        <div id="schedule-bar" class="panel review-bar">
+          <div class="review-progress">
+            <div class="review-progress__head">
+              <p id="schedule-count" class="review-progress__count" aria-live="polite">Сегодня: 0 из 0</p>
+              <p id="schedule-remaining" class="review-progress__remaining"></p>
+            </div>
+            <div id="schedule-progress" class="progress" role="progressbar" aria-label="Прогресс повторения на сегодня" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <span id="schedule-progress-bar"></span>
+            </div>
+          </div>
+          <button id="schedule-manage" class="btn btn--ghost" type="button" aria-expanded="false" aria-controls="schedule-manage-panel">
+            Слова
+          </button>
+        </div>
+
+        <div id="schedule-stage" class="review-stage"></div>
+
+        <div id="schedule-empty" class="empty" hidden>
+          <div class="empty__icon" aria-hidden="true">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+              <rect x="3" y="4" width="18" height="17" rx="3"></rect>
+              <path d="M8 2v4M16 2v4M3 10h18"></path>
+            </svg>
+          </div>
+          <h3>В расписании пока нет слов</h3>
+          <p>Добавьте слово здесь или в «Карточках» — оно автоматически появится в расписании.</p>
+          <button id="schedule-empty-action" class="btn btn--primary" type="button">Добавить слово</button>
+        </div>
+
+        <section id="schedule-manage-panel" class="panel schedule-manage" aria-labelledby="schedule-manage-title" hidden>
+          <div class="schedule-manage__head">
+            <div>
+              <h2 id="schedule-manage-title">Слова в расписании</h2>
+              <p id="schedule-stats" class="schedule-manage__hint">0 слов</p>
+            </div>
+            <button id="schedule-manage-close" class="icon-btn" type="button" aria-label="Закрыть список слов">&times;</button>
+          </div>
+
+          <form id="schedule-form" class="schedule-form" autocomplete="off" novalidate>
+            <div class="field">
+              <label for="schedule-word">Слово / Word</label>
+              <input id="schedule-word" type="text" placeholder="apple или яблоко" maxlength="80" required>
+            </div>
+            <div class="field">
+              <label for="schedule-translation">Перевод / Translation</label>
+              <input id="schedule-translation" type="text" placeholder="яблоко или apple" maxlength="80" required>
+            </div>
+            <button class="btn btn--primary" type="submit">Добавить</button>
+          </form>
+
+          <input id="schedule-search" class="schedule-search" type="search" placeholder="Поиск по словам и переводам…" aria-label="Поиск по словам в расписании" autocomplete="off">
+
+          <ul id="schedule-list" class="schedule-list"></ul>
+          <button id="schedule-more" class="btn btn--ghost schedule-more" type="button" hidden>Показать ещё</button>
+        </section>
+      </section>
     </main>
 
     <footer class="app-footer">
       <p>Данные хранятся локально в этом браузере. Для переноса на другое устройство используйте экспорт/импорт JSON или синхронизацию с GitHub Gist.</p>
+      <p>Озвучка: <a href="https://developer.puter.com" target="_blank" rel="noopener noreferrer">Powered by Puter</a>.</p>
     </footer>
   </div>
 
@@ -245,6 +308,7 @@
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
 
+  <script src="https://js.puter.com/v2/"></script>
   <script src="script.js"></script>
 </body>
 </html>

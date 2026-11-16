@@ -6,13 +6,23 @@
     settings: "wordflip.settings.v1",
     meta: "wordflip.meta.v1",
     sync: "wordflip.sync.v1",
-    firstTry: "wordflip.firstTry.v1"
+    firstTry: "wordflip.firstTry.v1",
+    schedule: "wordflip.schedule.v1"
   };
 
   const GIST_FILE = "wordflip-data.json";
   const GIST_DESCRIPTION = "WordFlip — flashcards data";
   const FUZZY_THRESHOLD = 0.7;
   const GIST_API = "https://api.github.com";
+
+  const SCHEDULE_INTERVALS = [0, 1, 2, 4, 7, 14, 30, 60, 180];
+  const SCHEDULE_MAX_STEP = SCHEDULE_INTERVALS.length - 1;
+  const SCHEDULE_DAILY_LIMIT = 300;
+  const SPEECH_RATE = 0.9;
+  const PUTER_TTS_VOICE = "Joanna";
+  const PUTER_TTS_ENGINE = "neural";
+  const PUTER_TTS_LANGUAGE = "en-US";
+  const PUTER_TTS_TIMEOUT = 12000;
 
   const DEMO_WORDS = [
     { english: "dream", russian: "мечта" },
@@ -39,6 +49,15 @@
       previous: [],
       savedAt: 0
     },
+    schedule: {
+      words: [],
+      daily: null,
+      updatedAt: 0,
+      flipped: false,
+      manageOpen: false,
+      search: "",
+      listLimit: 100
+    },
     pendingImport: [],
     importStep: 1,
     sync: {
@@ -55,6 +74,9 @@
 
   let els = {};
   let pushTimer = null;
+  let schedulePushTimer = null;
+  let schedulePushAt = 0;
+  let lastScheduleDay = "";
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
@@ -65,6 +87,10 @@
   function init() {
     cacheElements();
     loadState();
+    bindSpeechVoices();
+    primePuterAuth();
+    lastScheduleDay = todayKey();
+    ensureDailyPlan();
     bindEvents();
     applyTheme();
     renderMode();
@@ -76,6 +102,8 @@
     if (state.sync.enabled && hasSyncCredentials()) {
       window.setTimeout(autoSync, 700);
     }
+
+    window.setInterval(checkScheduleDay, 60000);
   }
 
   /* ==========================================================
@@ -108,6 +136,7 @@
     const rawMeta = storageGet(KEYS.meta);
     const rawSync = storageGet(KEYS.sync);
     const rawFirstTry = storageGet(KEYS.firstTry);
+    const rawSchedule = storageGet(KEYS.schedule);
 
     if (rawWords === null) {
       state.words = normalizeWordList(
@@ -181,6 +210,8 @@
         console.warn("Повреждённая история повторений:", error);
       }
     }
+
+    loadScheduleState(rawSchedule);
   }
 
   function persistWords() {
@@ -328,6 +359,518 @@
   }
 
   /* ==========================================================
+     Spaced repetition schedule
+     ========================================================== */
+
+  function dateKey(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return year + "-" + month + "-" + day;
+  }
+
+  function todayKey() {
+    return dateKey(new Date());
+  }
+
+  function parseDateKey(key) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(key || ""));
+    if (!match) {
+      return null;
+    }
+    return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  }
+
+  function addDaysToKey(key, days) {
+    const date = parseDateKey(key) || new Date();
+    date.setDate(date.getDate() + days);
+    return dateKey(date);
+  }
+
+  function formatDay(key) {
+    const date = parseDateKey(key);
+    if (!date) {
+      return String(key || "");
+    }
+    return date.toLocaleDateString("ru-RU", {
+      day: "numeric",
+      month: "long"
+    });
+  }
+
+  // Повторы ищутся по точному совпадению фразы (без игнорирования пробелов).
+  function scheduleKey(english, russian) {
+    return (
+      cleanText(english).toLocaleLowerCase("ru") +
+      "\u0000" +
+      cleanText(russian).toLocaleLowerCase("ru")
+    );
+  }
+
+  function normalizeScheduleWord(raw) {
+    if (!raw || typeof raw !== "object") {
+      return null;
+    }
+
+    const english = cleanText(
+      raw.english != null ? raw.english : raw.word != null ? raw.word : raw.en
+    );
+    const russian = cleanText(
+      raw.russian != null
+        ? raw.russian
+        : raw.translation != null
+          ? raw.translation
+          : raw.ru
+    );
+    if (!english || !russian) {
+      return null;
+    }
+
+    let step = Math.round(Number(raw.step));
+    if (!Number.isFinite(step)) {
+      step = 0;
+    }
+    step = Math.max(0, Math.min(SCHEDULE_MAX_STEP, step));
+
+    let interval = Math.floor(Number(raw.interval));
+    if (!Number.isFinite(interval) || interval < 0) {
+      interval = SCHEDULE_INTERVALS[step];
+    }
+
+    const dueDate = /^\d{4}-\d{2}-\d{2}$/.test(String(raw.dueDate || ""))
+      ? raw.dueDate
+      : todayKey();
+    const addedAt =
+      Number(raw.addedAt) || Number(raw.createdAt) || Date.now();
+    const updatedAt = Number(raw.updatedAt) || addedAt;
+
+    return {
+      id:
+        typeof raw.id === "string" && raw.id.trim() ? raw.id.trim() : uid(),
+      english: english,
+      russian: russian,
+      addedAt: addedAt,
+      updatedAt: updatedAt,
+      step: step,
+      interval: interval,
+      dueDate: dueDate,
+      lastReviewedOn:
+        typeof raw.lastReviewedOn === "string" ? raw.lastReviewedOn : "",
+      lastResult:
+        raw.lastResult === "known" || raw.lastResult === "forgot"
+          ? raw.lastResult
+          : ""
+    };
+  }
+
+  function normalizeScheduleWords(input) {
+    const map = new Map();
+
+    (Array.isArray(input) ? input : []).forEach(function (raw) {
+      const word = normalizeScheduleWord(raw);
+      if (!word) {
+        return;
+      }
+      const key = scheduleKey(word.english, word.russian);
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, word);
+        return;
+      }
+      // При повторе оставляем более старое слово.
+      if (word.addedAt < existing.addedAt) {
+        map.set(key, word);
+      }
+    });
+
+    return Array.from(map.values());
+  }
+
+  function createScheduleWord(english, russian, options) {
+    const opts = options || {};
+    const now = Date.now();
+
+    return {
+      id: uid(),
+      english: cleanText(english),
+      russian: cleanText(russian),
+      addedAt: Number(opts.addedAt) || now,
+      updatedAt: now,
+      step: 0,
+      interval: SCHEDULE_INTERVALS[0],
+      dueDate: opts.dueDate || todayKey(),
+      lastReviewedOn: "",
+      lastResult: ""
+    };
+  }
+
+  function normalizeDaily(raw) {
+    if (!raw || typeof raw.date !== "string") {
+      return null;
+    }
+    return {
+      date: raw.date,
+      queue: Array.isArray(raw.queue)
+        ? raw.queue.filter(function (id) {
+            return typeof id === "string";
+          })
+        : [],
+      completed: Array.isArray(raw.completed)
+        ? raw.completed.filter(function (id) {
+            return typeof id === "string";
+          })
+        : []
+    };
+  }
+
+  function loadScheduleState(raw) {
+    if (raw === null) {
+      state.schedule.words = [];
+      state.schedule.daily = null;
+      state.schedule.updatedAt = Date.now();
+      addWordsToSchedule(state.words, { save: false });
+      persistSchedule();
+      return;
+    }
+
+    try {
+      const data = JSON.parse(raw);
+      state.schedule.words = normalizeScheduleWords(
+        Array.isArray(data) ? data : data && Array.isArray(data.words) ? data.words : []
+      );
+      state.schedule.updatedAt =
+        Number(data && data.updatedAt) || Date.now();
+      state.schedule.daily = normalizeDaily(data && data.daily);
+    } catch (error) {
+      console.warn("Повреждённое расписание:", error);
+      state.schedule.words = [];
+      state.schedule.daily = null;
+      state.schedule.updatedAt = Date.now();
+    }
+  }
+
+  function persistSchedule() {
+    storageSet(
+      KEYS.schedule,
+      JSON.stringify({
+        version: 1,
+        updatedAt: state.schedule.updatedAt,
+        words: state.schedule.words,
+        daily: state.schedule.daily
+      })
+    );
+  }
+
+  function saveSchedule(options) {
+    const opts = options || {};
+    state.schedule.updatedAt = Date.now();
+    persistSchedule();
+
+    if (opts.sync === false) {
+      return;
+    }
+    markScheduleChanged();
+  }
+
+  function markScheduleChanged() {
+    if (!state.sync.enabled || !hasSyncCredentials()) {
+      return;
+    }
+    state.updatedAt = Date.now();
+    saveMeta();
+    queueSchedulePush();
+  }
+
+  function queueSchedulePush() {
+    if (!state.sync.enabled || !hasSyncCredentials()) {
+      return;
+    }
+    if (schedulePushTimer) {
+      window.clearTimeout(schedulePushTimer);
+    }
+    // Не отправляем gist после каждого ответа: не чаще раза в 30 секунд.
+    const wait = Math.max(1500, 30000 - (Date.now() - schedulePushAt));
+    schedulePushTimer = window.setTimeout(function () {
+      schedulePushTimer = null;
+      schedulePushAt = Date.now();
+      syncPush(true);
+    }, wait);
+  }
+
+  function addWordsToSchedule(words, options) {
+    const opts = options || {};
+    const existing = new Set(
+      state.schedule.words.map(function (word) {
+        return scheduleKey(word.english, word.russian);
+      })
+    );
+    const baseTime = Date.now();
+    let added = 0;
+
+    (Array.isArray(words) ? words : []).forEach(function (word, index) {
+      const english = cleanText(word && word.english);
+      const russian = cleanText(word && word.russian);
+      if (!english || !russian) {
+        return;
+      }
+
+      const key = scheduleKey(english, russian);
+      if (existing.has(key)) {
+        return;
+      }
+      existing.add(key);
+
+      const scheduled = createScheduleWord(english, russian, {
+        addedAt: baseTime + index
+      });
+      state.schedule.words.push(scheduled);
+
+      const daily = state.schedule.daily;
+      if (
+        daily &&
+        daily.date === todayKey() &&
+        daily.queue.length + daily.completed.length < SCHEDULE_DAILY_LIMIT
+      ) {
+        daily.queue.push(scheduled.id);
+      }
+      added += 1;
+    });
+
+    if (added && opts.save !== false) {
+      saveSchedule();
+    }
+    return added;
+  }
+
+  function mergeScheduleWords(incoming) {
+    if (!Array.isArray(incoming) || !incoming.length) {
+      return 0;
+    }
+
+    const map = new Map();
+    state.schedule.words.forEach(function (word) {
+      map.set(scheduleKey(word.english, word.russian), word);
+    });
+
+    let changed = 0;
+    incoming.forEach(function (raw) {
+      const word = normalizeScheduleWord(raw);
+      if (!word) {
+        return;
+      }
+
+      const key = scheduleKey(word.english, word.russian);
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, word);
+        changed += 1;
+        return;
+      }
+
+      // Идентичность и дату добавления берём у более старого слова,
+      // а прогресс — у более свежей записи.
+      if (word.addedAt < existing.addedAt) {
+        existing.english = word.english;
+        existing.russian = word.russian;
+        existing.addedAt = word.addedAt;
+      }
+      if ((word.updatedAt || 0) > (existing.updatedAt || 0)) {
+        existing.step = word.step;
+        existing.interval = word.interval;
+        existing.dueDate = word.dueDate;
+        existing.lastReviewedOn = word.lastReviewedOn;
+        existing.lastResult = word.lastResult;
+        existing.updatedAt = word.updatedAt;
+        changed += 1;
+      }
+    });
+
+    if (changed) {
+      state.schedule.words = Array.from(map.values());
+    }
+    return changed;
+  }
+
+  function findScheduleWord(id) {
+    return state.schedule.words.find(function (word) {
+      return word.id === id;
+    });
+  }
+
+  function compareScheduleDue(left, right) {
+    if (left.dueDate !== right.dueDate) {
+      return left.dueDate < right.dueDate ? -1 : 1;
+    }
+    if (left.addedAt !== right.addedAt) {
+      return left.addedAt - right.addedAt;
+    }
+    return left.english.localeCompare(right.english, "ru", {
+      sensitivity: "base"
+    });
+  }
+
+  function distributeOverflow(overflow, today) {
+    const loads = new Map();
+    state.schedule.words.forEach(function (word) {
+      if (word.dueDate > today) {
+        loads.set(word.dueDate, (loads.get(word.dueDate) || 0) + 1);
+      }
+    });
+
+    let cursor = addDaysToKey(today, 1);
+    const now = Date.now();
+
+    overflow.forEach(function (word) {
+      while ((loads.get(cursor) || 0) >= SCHEDULE_DAILY_LIMIT) {
+        cursor = addDaysToKey(cursor, 1);
+      }
+      word.dueDate = cursor;
+      word.updatedAt = now;
+      loads.set(cursor, (loads.get(cursor) || 0) + 1);
+    });
+  }
+
+  function buildDailyPlan(today) {
+    const due = state.schedule.words
+      .filter(function (word) {
+        return word.dueDate <= today;
+      })
+      .sort(compareScheduleDue);
+
+    const selected = due.slice(0, SCHEDULE_DAILY_LIMIT);
+    const overflow = due.slice(SCHEDULE_DAILY_LIMIT);
+    if (overflow.length) {
+      distributeOverflow(overflow, today);
+    }
+
+    return {
+      date: today,
+      queue: selected.map(function (word) {
+        return word.id;
+      }),
+      completed: []
+    };
+  }
+
+  function pruneDaily(daily) {
+    const ids = new Set(
+      state.schedule.words.map(function (word) {
+        return word.id;
+      })
+    );
+    const seen = new Set();
+    const queue = daily.queue.filter(function (id) {
+      if (!ids.has(id) || seen.has(id)) {
+        return false;
+      }
+      seen.add(id);
+      return true;
+    });
+    const seenCompleted = new Set();
+    const completed = daily.completed.filter(function (id) {
+      if (!ids.has(id) || seen.has(id) || seenCompleted.has(id)) {
+        return false;
+      }
+      seenCompleted.add(id);
+      return true;
+    });
+
+    const changed =
+      queue.length !== daily.queue.length ||
+      completed.length !== daily.completed.length;
+
+    return {
+      daily: { date: daily.date, queue: queue, completed: completed },
+      changed: changed
+    };
+  }
+
+  function appendDueToDaily(daily, today) {
+    const queued = new Set(daily.queue);
+    const completed = new Set(daily.completed);
+    let capacity =
+      SCHEDULE_DAILY_LIMIT - queued.size - completed.size;
+
+    if (capacity <= 0) {
+      return false;
+    }
+
+    const candidates = state.schedule.words
+      .filter(function (word) {
+        return (
+          word.dueDate <= today &&
+          !queued.has(word.id) &&
+          !completed.has(word.id)
+        );
+      })
+      .sort(compareScheduleDue);
+
+    if (!candidates.length) {
+      return false;
+    }
+
+    candidates.slice(0, capacity).forEach(function (word) {
+      daily.queue.push(word.id);
+    });
+    return true;
+  }
+
+  function ensureDailyPlan() {
+    const today = todayKey();
+    let daily = state.schedule.daily;
+
+    if (!daily || daily.date !== today) {
+      daily = buildDailyPlan(today);
+      state.schedule.daily = daily;
+      persistSchedule();
+      return daily;
+    }
+
+    const pruned = pruneDaily(daily);
+    daily = pruned.daily;
+    state.schedule.daily = daily;
+
+    if (appendDueToDaily(daily, today) || pruned.changed) {
+      persistSchedule();
+    }
+    return daily;
+  }
+
+  function getNextScheduleInfo() {
+    const today = todayKey();
+    let nextDate = "";
+    let count = 0;
+
+    state.schedule.words.forEach(function (word) {
+      if (word.dueDate <= today) {
+        return;
+      }
+      if (!nextDate || word.dueDate < nextDate) {
+        nextDate = word.dueDate;
+        count = 1;
+      } else if (word.dueDate === nextDate) {
+        count += 1;
+      }
+    });
+
+    return nextDate ? { date: nextDate, count: count } : null;
+  }
+
+  function checkScheduleDay() {
+    const today = todayKey();
+    if (today === lastScheduleDay) {
+      return;
+    }
+    lastScheduleDay = today;
+    state.schedule.flipped = false;
+    ensureDailyPlan();
+    updateScheduleBadge();
+    if (state.view === "schedule") {
+      renderSchedule({ focus: true });
+    }
+  }
+
+  /* ==========================================================
      Elements and events
      ========================================================== */
 
@@ -368,6 +911,27 @@
       reviewProgress: document.getElementById("review-progress"),
       reviewProgressBar: document.getElementById("review-progress-bar"),
       reviewRestart: document.getElementById("review-restart"),
+
+      viewSchedule: document.getElementById("view-schedule"),
+      scheduleBadge: document.getElementById("schedule-badge"),
+      scheduleBar: document.getElementById("schedule-bar"),
+      scheduleStage: document.getElementById("schedule-stage"),
+      scheduleEmpty: document.getElementById("schedule-empty"),
+      scheduleEmptyAction: document.getElementById("schedule-empty-action"),
+      scheduleCount: document.getElementById("schedule-count"),
+      scheduleRemaining: document.getElementById("schedule-remaining"),
+      scheduleProgress: document.getElementById("schedule-progress"),
+      scheduleProgressBar: document.getElementById("schedule-progress-bar"),
+      scheduleManage: document.getElementById("schedule-manage"),
+      scheduleManagePanel: document.getElementById("schedule-manage-panel"),
+      scheduleManageClose: document.getElementById("schedule-manage-close"),
+      scheduleStats: document.getElementById("schedule-stats"),
+      scheduleForm: document.getElementById("schedule-form"),
+      scheduleWord: document.getElementById("schedule-word"),
+      scheduleTranslation: document.getElementById("schedule-translation"),
+      scheduleSearch: document.getElementById("schedule-search"),
+      scheduleList: document.getElementById("schedule-list"),
+      scheduleMore: document.getElementById("schedule-more"),
 
       importOpen: document.getElementById("import-open"),
       exportBtn: document.getElementById("export-btn"),
@@ -425,6 +989,30 @@
       els.wordInput.focus();
       els.wordInput.scrollIntoView({ behavior: "smooth", block: "center" });
     });
+
+    els.scheduleManage.addEventListener("click", function () {
+      setScheduleManage(!state.schedule.manageOpen);
+    });
+    els.scheduleManageClose.addEventListener("click", function () {
+      setScheduleManage(false);
+    });
+    els.scheduleEmptyAction.addEventListener("click", function () {
+      setScheduleManage(true);
+      els.scheduleWord.focus();
+    });
+    els.scheduleForm.addEventListener("submit", handleScheduleAdd);
+    els.scheduleSearch.addEventListener("input", function () {
+      state.schedule.search = els.scheduleSearch.value;
+      state.schedule.listLimit = 100;
+      renderScheduleManage();
+    });
+    els.scheduleList.addEventListener("click", handleScheduleListClick);
+    els.scheduleMore.addEventListener("click", function () {
+      state.schedule.listLimit += 100;
+      renderScheduleManage();
+    });
+    els.scheduleStage.addEventListener("click", handleScheduleStageClick);
+    els.scheduleStage.addEventListener("keydown", handleScheduleStageKeydown);
 
     els.themeToggle.addEventListener("click", cycleTheme);
 
@@ -495,7 +1083,16 @@
     });
 
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden && state.sync.enabled && hasSyncCredentials()) {
+      if (document.hidden) {
+        if (schedulePushTimer) {
+          window.clearTimeout(schedulePushTimer);
+          schedulePushTimer = null;
+          schedulePushAt = Date.now();
+          syncPush(true);
+        }
+        return;
+      }
+      if (state.sync.enabled && hasSyncCredentials()) {
         autoSync();
       }
     });
@@ -533,6 +1130,7 @@
     state.mode = mode;
     state.flipped.clear();
     state.review.flipped = false;
+    state.schedule.flipped = false;
     saveSettings();
     renderMode();
     render();
@@ -585,10 +1183,9 @@
      ========================================================== */
 
   function renderViews() {
-    const isReview = state.view === "review";
-
-    els.viewCards.hidden = isReview;
-    els.viewReview.hidden = !isReview;
+    els.viewCards.hidden = state.view !== "cards";
+    els.viewReview.hidden = state.view !== "review";
+    els.viewSchedule.hidden = state.view !== "schedule";
 
     els.viewTabs.forEach(function (button) {
       const selected = button.dataset.view === state.view;
@@ -598,7 +1195,7 @@
   }
 
   function setView(view) {
-    if (view !== "cards" && view !== "review") {
+    if (view !== "cards" && view !== "review" && view !== "schedule") {
       return;
     }
     state.view = view;
@@ -608,6 +1205,9 @@
       ensureReviewStarted();
       reconcileReview();
       renderReview();
+    } else if (view === "schedule") {
+      state.schedule.flipped = false;
+      renderSchedule();
     }
   }
 
@@ -881,8 +1481,8 @@
       "Нажмите, чтобы скрыть перевод"
     );
 
-    front.setAttribute("aria-hidden", String(isFlipped));
-    back.setAttribute("aria-hidden", String(!isFlipped));
+    setFaceHidden(front, isFlipped);
+    setFaceHidden(back, !isFlipped);
 
     inner.append(front, back);
     card.append(inner);
@@ -1065,10 +1665,10 @@
     const front = card.querySelector(".card__face--front");
     const back = card.querySelector(".card__face--back");
     if (front) {
-      front.setAttribute("aria-hidden", String(isFlipped));
+      setFaceHidden(front, isFlipped);
     }
     if (back) {
-      back.setAttribute("aria-hidden", String(!isFlipped));
+      setFaceHidden(back, !isFlipped);
     }
 
     const word = state.words.find(function (item) {
@@ -1111,7 +1711,10 @@
     if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") {
       return;
     }
-    if (event.target.closest("[data-review-action]")) {
+    if (
+      event.target.closest("[data-review-action]") ||
+      event.target.closest(".speak-btn")
+    ) {
       return;
     }
 
@@ -1187,6 +1790,574 @@
 
     renderReview({ focus: true });
     toast("Колода перемешана — начинаем заново", "info");
+  }
+
+  /* ==========================================================
+     Schedule view
+     ========================================================== */
+
+  function renderSchedule(options) {
+    const opts = options || {};
+    const daily = ensureDailyPlan();
+    const done = daily.completed.length;
+    const total = done + daily.queue.length;
+    const remaining = daily.queue.length;
+    const percent = total ? Math.round((done / total) * 100) : 0;
+
+    els.scheduleCount.textContent = "Сегодня: " + done + " из " + total;
+    els.scheduleRemaining.textContent = remaining
+      ? "Осталось: " + remaining + " " + wordPlural(remaining)
+      : "Готово";
+    els.scheduleProgressBar.style.width = percent + "%";
+    els.scheduleProgress.setAttribute("aria-valuenow", String(percent));
+    els.scheduleManage.textContent = "Слова (" + state.schedule.words.length + ")";
+
+    if (!state.schedule.words.length) {
+      els.scheduleBar.hidden = true;
+      els.scheduleStage.hidden = true;
+      els.scheduleStage.replaceChildren();
+      els.scheduleEmpty.hidden = false;
+      updateScheduleBadge();
+      if (state.schedule.manageOpen) {
+        renderScheduleManage();
+      }
+      return;
+    }
+
+    els.scheduleEmpty.hidden = true;
+    els.scheduleBar.hidden = false;
+    els.scheduleStage.hidden = false;
+
+    if (!remaining) {
+      renderScheduleDone(total);
+      if (opts.focus) {
+        const action = els.scheduleStage.querySelector("[data-schedule-action]");
+        if (action) {
+          action.focus({ preventScroll: true });
+        }
+      }
+    } else {
+      renderScheduleCard();
+      if (opts.focus) {
+        const card = els.scheduleStage.querySelector(".card--review");
+        if (card) {
+          card.focus({ preventScroll: true });
+        }
+      }
+    }
+
+    updateScheduleBadge();
+    if (state.schedule.manageOpen) {
+      renderScheduleManage();
+    }
+  }
+
+  function updateScheduleBadge() {
+    if (!els.scheduleBadge) {
+      return;
+    }
+    const daily = state.schedule.daily;
+    const remaining =
+      daily && daily.date === todayKey() ? daily.queue.length : 0;
+
+    if (remaining > 0) {
+      els.scheduleBadge.hidden = false;
+      els.scheduleBadge.textContent = String(remaining);
+    } else {
+      els.scheduleBadge.hidden = true;
+      els.scheduleBadge.textContent = "";
+    }
+  }
+
+  function renderScheduleCard() {
+    const id = state.schedule.daily.queue[0];
+    const word = findScheduleWord(id);
+    if (!word) {
+      state.schedule.daily.queue.shift();
+      renderSchedule();
+      return;
+    }
+
+    const promptLang = state.mode;
+    const answerLang = state.mode === "en" ? "ru" : "en";
+    const prompt = promptLang === "en" ? word.english : word.russian;
+    const answer = answerLang === "en" ? word.english : word.russian;
+    const isFlipped = state.schedule.flipped;
+
+    const card = document.createElement("article");
+    card.className = "card card--review" + (isFlipped ? " is-flipped" : "");
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-pressed", String(isFlipped));
+    card.setAttribute(
+      "aria-label",
+      prompt + ". " + (isFlipped ? "Перевод показан" : "Показать перевод")
+    );
+
+    const inner = document.createElement("div");
+    inner.className = "card__inner";
+
+    const front = createCardFace(
+      "front",
+      promptLang.toUpperCase(),
+      prompt,
+      "Нажмите, чтобы увидеть перевод"
+    );
+    const back = createCardFace(
+      "back",
+      answerLang.toUpperCase(),
+      answer,
+      "Нажмите, чтобы скрыть перевод"
+    );
+
+    setFaceHidden(front, isFlipped);
+    setFaceHidden(back, !isFlipped);
+
+    inner.append(front, back);
+    card.append(inner);
+
+    const cardWrap = document.createElement("div");
+    cardWrap.className = "review-card";
+    cardWrap.append(card);
+
+    const actions = document.createElement("div");
+    actions.className = "review-actions";
+    actions.hidden = !isFlipped;
+    actions.append(
+      createScheduleButton("forgot"),
+      createScheduleButton("known")
+    );
+
+    els.scheduleStage.replaceChildren(cardWrap, actions);
+  }
+
+  function createScheduleButton(kind) {
+    const known = kind === "known";
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className =
+      "btn review-action " +
+      (known ? "review-action--known" : "review-action--forgot");
+    button.dataset.scheduleAction = kind;
+    button.setAttribute("aria-label", known ? "Знаю" : "Не знаю / Забыл");
+
+    const icon = document.createElement("span");
+    icon.className = "review-action__icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = known ? "✓" : "✕";
+
+    const label = document.createElement("span");
+    label.textContent = known ? "Знаю" : "Не знаю";
+
+    button.append(icon, label);
+    return button;
+  }
+
+  function renderScheduleDone(total) {
+    const panel = document.createElement("div");
+    panel.className = "review-done";
+    panel.setAttribute("role", "status");
+
+    const icon = document.createElement("div");
+    icon.className = "review-done__icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "✓";
+
+    const title = document.createElement("h2");
+    title.textContent = total ? "На сегодня всё!" : "Сегодня повторений нет";
+
+    const text = document.createElement("p");
+    if (total) {
+      text.textContent =
+        "Повторено " +
+        total +
+        " " +
+        wordPlural(total) +
+        ". Прогресс сохранён.";
+    } else {
+      text.textContent = "Загляните позже — слова появятся по расписанию.";
+    }
+
+    const next = getNextScheduleInfo();
+    if (next) {
+      text.textContent +=
+        " Следующее повторение: " +
+        formatDay(next.date) +
+        " — " +
+        next.count +
+        " " +
+        wordPlural(next.count) +
+        ".";
+    }
+
+    const note = document.createElement("p");
+    note.className = "schedule-done__note";
+    note.textContent =
+      "Лимит — " +
+      SCHEDULE_DAILY_LIMIT +
+      " слов в день, просроченные переносятся на следующие дни.";
+
+    const actions = document.createElement("div");
+    actions.className = "schedule-done__actions";
+
+    const manage = document.createElement("button");
+    manage.type = "button";
+    manage.className = "btn btn--ghost";
+    manage.dataset.scheduleAction = "manage";
+    manage.textContent = "Слова в расписании";
+
+    const cards = document.createElement("button");
+    cards.type = "button";
+    cards.className = "btn btn--primary";
+    cards.dataset.scheduleAction = "cards";
+    cards.textContent = "К карточкам";
+
+    actions.append(manage, cards);
+    panel.append(icon, title, text, note, actions);
+    els.scheduleStage.replaceChildren(panel);
+  }
+
+  function toggleScheduleFlip() {
+    const card = els.scheduleStage.querySelector(".card--review");
+    if (!card) {
+      return;
+    }
+
+    const isFlipped = !state.schedule.flipped;
+    state.schedule.flipped = isFlipped;
+
+    card.classList.toggle("is-flipped", isFlipped);
+    card.setAttribute("aria-pressed", String(isFlipped));
+
+    const front = card.querySelector(".card__face--front");
+    const back = card.querySelector(".card__face--back");
+    if (front) {
+      setFaceHidden(front, isFlipped);
+    }
+    if (back) {
+      setFaceHidden(back, !isFlipped);
+    }
+
+    const word = findScheduleWord(state.schedule.daily.queue[0]);
+    if (word) {
+      const prompt = state.mode === "en" ? word.english : word.russian;
+      card.setAttribute(
+        "aria-label",
+        prompt + ". " + (isFlipped ? "Перевод показан" : "Показать перевод")
+      );
+    }
+
+    const actions = els.scheduleStage.querySelector(".review-actions");
+    if (actions) {
+      actions.hidden = !isFlipped;
+    }
+  }
+
+  function handleScheduleStageClick(event) {
+    const action = event.target.closest("[data-schedule-action]");
+    if (action) {
+      const value = action.dataset.scheduleAction;
+      if (value === "known") {
+        answerSchedule(true);
+      } else if (value === "forgot") {
+        answerSchedule(false);
+      } else if (value === "manage") {
+        setScheduleManage(true);
+      } else if (value === "cards") {
+        setView("cards");
+      }
+      return;
+    }
+
+    if (event.target.closest(".card--review")) {
+      toggleScheduleFlip();
+    }
+  }
+
+  function handleScheduleStageKeydown(event) {
+    if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") {
+      return;
+    }
+    if (
+      event.target.closest("[data-schedule-action]") ||
+      event.target.closest(".speak-btn")
+    ) {
+      return;
+    }
+
+    const card = event.target.closest(".card--review");
+    if (!card) {
+      return;
+    }
+
+    event.preventDefault();
+    toggleScheduleFlip();
+  }
+
+  function answerSchedule(known) {
+    const daily = state.schedule.daily;
+    if (!daily || !daily.queue.length) {
+      return;
+    }
+
+    const id = daily.queue.shift();
+    const word = findScheduleWord(id);
+    if (!word) {
+      renderSchedule();
+      return;
+    }
+
+    const today = todayKey();
+
+    if (known) {
+      word.step = Math.min(word.step + 1, SCHEDULE_MAX_STEP);
+      word.interval = SCHEDULE_INTERVALS[word.step];
+    } else {
+      word.step = Math.max(0, word.step - 1);
+      word.interval = Math.max(0, Math.floor(word.interval / 2));
+    }
+
+    word.dueDate = addDaysToKey(today, word.interval);
+    word.lastReviewedOn = today;
+    word.lastResult = known ? "known" : "forgot";
+    word.updatedAt = Date.now();
+
+    if (!known && word.interval === 0) {
+      // Минимальный интервал — вернуть слово в конец сегодняшней очереди.
+      daily.queue.push(id);
+    } else if (daily.completed.indexOf(id) === -1) {
+      daily.completed.push(id);
+    }
+
+    state.schedule.flipped = false;
+    saveSchedule();
+    renderSchedule({ focus: true });
+
+    if (!daily.queue.length) {
+      toast("На сегодня всё — расписание сохранено", "success");
+    }
+  }
+
+  function setScheduleManage(open) {
+    state.schedule.manageOpen = Boolean(open);
+    els.scheduleManage.setAttribute(
+      "aria-expanded",
+      String(state.schedule.manageOpen)
+    );
+    els.scheduleManagePanel.hidden = !state.schedule.manageOpen;
+
+    if (state.schedule.manageOpen) {
+      renderScheduleManage();
+    }
+  }
+
+  function getScheduleDueLabel(word) {
+    const today = todayKey();
+    if (word.dueDate < today) {
+      return "просрочено";
+    }
+    if (word.dueDate === today) {
+      return "сегодня";
+    }
+    if (word.dueDate === addDaysToKey(today, 1)) {
+      return "завтра";
+    }
+    return formatDay(word.dueDate);
+  }
+
+  function getFilteredScheduleWords() {
+    const query = normalize(state.schedule.search);
+    return state.schedule.words
+      .filter(function (word) {
+        if (!query) {
+          return true;
+        }
+        return (
+          normalize(word.english).indexOf(query) !== -1 ||
+          normalize(word.russian).indexOf(query) !== -1
+        );
+      })
+      .sort(compareScheduleDue);
+  }
+
+  function renderScheduleManage() {
+    const total = state.schedule.words.length;
+    const daily = state.schedule.daily;
+    const remaining = daily && daily.date === todayKey() ? daily.queue.length : 0;
+    els.scheduleStats.textContent =
+      "Всего: " + total + " " + wordPlural(total) + " · осталось сегодня: " + remaining;
+
+    const filtered = getFilteredScheduleWords();
+    const visible = filtered.slice(0, state.schedule.listLimit);
+    const fragment = document.createDocumentFragment();
+
+    if (!visible.length) {
+      const empty = document.createElement("li");
+      empty.className = "schedule-item schedule-item--empty";
+      empty.textContent = total
+        ? "Ничего не найдено по запросу «" + state.schedule.search.trim() + "»."
+        : "Пока пусто. Добавьте первое слово.";
+      fragment.append(empty);
+    } else {
+      visible.forEach(function (word) {
+        const today = todayKey();
+        const item = document.createElement("li");
+        item.className = "schedule-item";
+
+        const text = document.createElement("div");
+        text.className = "schedule-item__text";
+
+        const pair = document.createElement("span");
+        pair.className = "schedule-item__pair";
+        pair.textContent = word.english + " — " + word.russian;
+
+        const meta = document.createElement("span");
+        meta.className = "schedule-item__meta";
+        meta.textContent =
+          "Ступень " +
+          (word.step + 1) +
+          " из " +
+          (SCHEDULE_MAX_STEP + 1) +
+          " · " +
+          getScheduleDueLabel(word);
+        if (word.dueDate <= today) {
+          meta.classList.add("is-due");
+        }
+
+        text.append(pair, meta);
+
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "schedule-item__delete";
+        remove.dataset.scheduleId = word.id;
+        remove.setAttribute(
+          "aria-label",
+          "Удалить слово " + word.english + " из расписания"
+        );
+        remove.title = "Удалить из расписания";
+        remove.textContent = "×";
+
+        item.append(text, remove);
+        fragment.append(item);
+      });
+    }
+
+    els.scheduleList.replaceChildren(fragment);
+    els.scheduleMore.hidden = filtered.length <= state.schedule.listLimit;
+  }
+
+  function handleScheduleListClick(event) {
+    const button = event.target.closest("[data-schedule-id]");
+    if (!button) {
+      return;
+    }
+    deleteScheduleWord(button.dataset.scheduleId);
+  }
+
+  function handleScheduleAdd(event) {
+    event.preventDefault();
+
+    const first = cleanText(els.scheduleWord.value);
+    const second = cleanText(els.scheduleTranslation.value);
+
+    if (!first || !second) {
+      toast("Заполните слово и перевод", "error");
+      (first ? els.scheduleTranslation : els.scheduleWord).focus();
+      return;
+    }
+
+    const info = detectInfo(first);
+    if (!info.lang) {
+      toast("Введите слово буквами", "error");
+      els.scheduleWord.focus();
+      return;
+    }
+
+    if (normalize(first) === normalize(second)) {
+      toast("Слово и перевод не должны совпадать", "error");
+      els.scheduleTranslation.focus();
+      return;
+    }
+
+    const translationInfo = detectInfo(second);
+    if (!translationInfo.lang) {
+      toast("Перевод должен содержать буквы", "error");
+      els.scheduleTranslation.focus();
+      return;
+    }
+
+    if (translationInfo.lang === info.lang) {
+      toast(
+        "Перевод должен быть на " +
+          (info.lang === "ru" ? "английском" : "русском") +
+          " языке",
+        "error"
+      );
+      els.scheduleTranslation.focus();
+      return;
+    }
+
+    const english = info.lang === "ru" ? second : first;
+    const russian = info.lang === "ru" ? first : second;
+
+    if (
+      state.schedule.words.some(function (word) {
+        return scheduleKey(word.english, word.russian) === scheduleKey(english, russian);
+      })
+    ) {
+      toast("Такое слово уже есть в расписании", "error");
+      els.scheduleWord.focus();
+      els.scheduleWord.select();
+      return;
+    }
+
+    const added = addWordsToSchedule(
+      [{ english: english, russian: russian }],
+      { save: false }
+    );
+    if (!added) {
+      toast("Не удалось добавить слово", "error");
+      return;
+    }
+
+    saveSchedule();
+    renderSchedule();
+    els.scheduleForm.reset();
+    els.scheduleWord.focus();
+    toast("Слово добавлено в расписание", "success");
+  }
+
+  function deleteScheduleWord(id) {
+    const word = findScheduleWord(id);
+    if (!word) {
+      return;
+    }
+
+    const approved = window.confirm(
+      "Удалить «" + word.english + " — " + word.russian + "» из расписания?"
+    );
+    if (!approved) {
+      return;
+    }
+
+    state.schedule.words = state.schedule.words.filter(function (item) {
+      return item.id !== id;
+    });
+
+    if (state.schedule.daily) {
+      state.schedule.daily.queue = state.schedule.daily.queue.filter(function (item) {
+        return item !== id;
+      });
+      state.schedule.daily.completed = state.schedule.daily.completed.filter(function (item) {
+        return item !== id;
+      });
+    }
+
+    state.schedule.flipped = false;
+    saveSchedule();
+    renderSchedule();
+    toast("Слово удалено из расписания", "info");
   }
 
   /* ==========================================================
@@ -1288,7 +2459,9 @@
       return;
     }
 
-    state.words.unshift({ id: uid(), english: english, russian: russian });
+    const word = { id: uid(), english: english, russian: russian };
+    state.words.unshift(word);
+    addWordsToSchedule([word]);
     saveWords();
     render();
 
@@ -1341,9 +2514,12 @@
     els.shuffleBtn.disabled = state.words.length < 2;
     reconcileReview();
     updateReviewBadge();
+    updateScheduleBadge();
 
     if (state.view === "review") {
       renderReview();
+    } else if (state.view === "schedule") {
+      renderSchedule();
     }
   }
 
@@ -1395,8 +2571,8 @@
         "Нажмите, чтобы скрыть перевод"
       );
 
-      front.setAttribute("aria-hidden", String(isFlipped));
-      back.setAttribute("aria-hidden", String(!isFlipped));
+      setFaceHidden(front, isFlipped);
+      setFaceHidden(back, !isFlipped);
 
       inner.append(front, back);
 
@@ -1414,6 +2590,509 @@
     els.cards.append(fragment);
   }
 
+  /* ==========================================================
+     Pronunciation (Puter.js + локальный Web Speech API)
+     ========================================================== */
+
+  let speechVoices = [];
+  let speechTimer = null;
+  let speechFallbackTimer = null;
+  let pendingSpeech = null;
+  let puterAudio = null;
+  let puterRequest = 0;
+  let puterSignedIn = null;
+  let puterSignInPromise = null;
+  let puterAuthDeclined = false;
+  let puterLoadingButton = null;
+  let puterFallbackNotified = false;
+
+  function hasPuterSpeech() {
+    return Boolean(
+      window.puter &&
+        window.puter.ai &&
+        typeof window.puter.ai.txt2speech === "function"
+    );
+  }
+
+  function hasPuterAuth() {
+    return Boolean(
+      window.puter &&
+        window.puter.auth &&
+        typeof window.puter.auth.isSignedIn === "function" &&
+        typeof window.puter.auth.signIn === "function"
+    );
+  }
+
+  // Puter работает по модели «платит пользователь» и может попросить вход.
+  // Статус проверяется один раз при загрузке, чтобы не открывать попап зря.
+  function primePuterAuth() {
+    if (!hasPuterSpeech() || !hasPuterAuth()) {
+      return;
+    }
+
+    try {
+      puterSignedIn = Boolean(window.puter.auth.isSignedIn());
+    } catch (error) {
+      console.warn("Не удалось проверить вход в Puter:", error);
+    }
+  }
+
+  function stopPuterAudio() {
+    if (!puterAudio) {
+      return;
+    }
+
+    try {
+      puterAudio.pause();
+      puterAudio.currentTime = 0;
+    } catch (error) {
+      console.warn("Не удалось остановить озвучку Puter:", error);
+    }
+    puterAudio = null;
+  }
+
+  function setSpeakLoading(button, loading) {
+    if (!button) {
+      return;
+    }
+
+    if (loading) {
+      // Индикация всегда только на одной кнопке: при переходе к другому
+      // слову старая кнопка не должна остаться «крутиться».
+      if (puterLoadingButton && puterLoadingButton !== button) {
+        setSpeakLoading(puterLoadingButton, false);
+      }
+      puterLoadingButton = button;
+    } else if (puterLoadingButton === button) {
+      puterLoadingButton = null;
+    }
+
+    button.classList.toggle("is-loading", Boolean(loading));
+    button.setAttribute("aria-busy", String(Boolean(loading)));
+  }
+
+  function describePuterAuthError(error) {
+    const code = error && (error.error || error.code);
+
+    if (code === "auth_window_closed") {
+      return "Вход в Puter отменён — озвучиваем системным голосом";
+    }
+    if (code === "popup_blocked") {
+      return "Браузер заблокировал окно входа в Puter — озвучиваем системным голосом";
+    }
+    if (code === "unsupported_origin") {
+      return "Для Puter нужен адрес http(s), а не файл с диска";
+    }
+    return "Не удалось войти в Puter — озвучиваем системным голосом";
+  }
+
+  function fallbackToLocalVoice(text, message) {
+    const spoke = speakWithLocalVoice(text);
+
+    if (!spoke) {
+      toast(
+        "Не удалось озвучить слово. Проверьте интернет и попробуйте ещё раз.",
+        "error"
+      );
+      return;
+    }
+
+    if (message && !puterFallbackNotified) {
+      puterFallbackNotified = true;
+      toast(message, "info");
+    }
+  }
+
+  // Puter может не ответить вовсе (например, если попап входа закрыт),
+  // поэтому запрос ограничен по времени — кнопка не зависнет в загрузке.
+  function puterTextToSpeech(text) {
+    return new Promise(function (resolve, reject) {
+      let settled = false;
+      const timer = window.setTimeout(function () {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        reject(new Error("Puter TTS timeout"));
+      }, PUTER_TTS_TIMEOUT);
+
+      window.puter.ai
+        .txt2speech(text, {
+          voice: PUTER_TTS_VOICE,
+          engine: PUTER_TTS_ENGINE,
+          language: PUTER_TTS_LANGUAGE
+        })
+        .then(
+          function (audio) {
+            if (settled) {
+              // Ответ пришёл после таймаута — не играем его.
+              try {
+                audio.pause();
+              } catch (error) {
+                // ignore
+              }
+              return;
+            }
+            settled = true;
+            window.clearTimeout(timer);
+            resolve(audio);
+          },
+          function (error) {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            window.clearTimeout(timer);
+            reject(error);
+          }
+        );
+    });
+  }
+
+  function requestPuterSpeech(text, button, requestId) {
+    setSpeakLoading(button, true);
+
+    puterTextToSpeech(text)
+      .then(function (audio) {
+        // Пока шёл запрос, могли нажать другое слово — старый ответ не играем.
+        if (requestId !== puterRequest) {
+          try {
+            audio.pause();
+          } catch (error) {
+            // ignore
+          }
+          return;
+        }
+
+        setSpeakLoading(button, false);
+        puterAudio = audio;
+
+        try {
+          audio.playbackRate = SPEECH_RATE;
+        } catch (error) {
+          console.warn("Не удалось изменить скорость озвучки:", error);
+        }
+
+        const forget = function () {
+          if (puterAudio === audio) {
+            puterAudio = null;
+          }
+        };
+        audio.addEventListener("ended", forget);
+        audio.addEventListener("pause", forget);
+
+        const playing = audio.play();
+        if (playing && typeof playing.catch === "function") {
+          playing.catch(function (error) {
+            console.warn("Не удалось воспроизвести озвучку:", error);
+            toast("Не удалось воспроизвести озвучку", "error");
+          });
+        }
+      })
+      .catch(function (error) {
+        if (requestId !== puterRequest) {
+          return;
+        }
+
+        setSpeakLoading(button, false);
+        console.warn("Puter TTS недоступен:", error);
+        fallbackToLocalVoice(
+          text,
+          "Puter не ответил — включена системная озвучка"
+        );
+      });
+  }
+
+  function speakEnglish(word, button) {
+    const text = cleanText(word);
+    if (!text) {
+      return;
+    }
+
+    const requestId = ++puterRequest;
+    stopPuterAudio();
+    clearSpeechTimers();
+    pendingSpeech = null;
+
+    // Если Puter.js не загрузился, остаётся системный английский голос.
+    if (!hasPuterSpeech()) {
+      speakWithLocalVoice(text);
+      return;
+    }
+
+    if (hasPuterAuth() && puterSignedIn === false) {
+      // Пользователь уже отказался от входа — не открываем попап повторно.
+      if (puterAuthDeclined) {
+        fallbackToLocalVoice(
+          text,
+          "Без входа в Puter озвучка идёт системным голосом"
+        );
+        return;
+      }
+
+      // Попап входа можно открыть только из обработчика клика.
+      setSpeakLoading(button, true);
+
+      let signing = puterSignInPromise;
+      if (!signing) {
+        try {
+          signing = window.puter.auth.signIn();
+        } catch (error) {
+          signing = Promise.reject(error);
+        }
+      }
+
+      puterSignInPromise = Promise.resolve(signing).then(
+        function () {
+          puterSignInPromise = null;
+          puterSignedIn = true;
+        },
+        function (error) {
+          puterSignInPromise = null;
+          puterAuthDeclined = true;
+          throw error;
+        }
+      );
+
+      puterSignInPromise.then(
+        function () {
+          if (requestId !== puterRequest) {
+            return;
+          }
+          requestPuterSpeech(text, button, requestId);
+        },
+        function (error) {
+          if (requestId !== puterRequest) {
+            return;
+          }
+          setSpeakLoading(button, false);
+          console.warn("Вход в Puter не выполнен:", error);
+          fallbackToLocalVoice(text, describePuterAuthError(error));
+        }
+      );
+      return;
+    }
+
+    requestPuterSpeech(text, button, requestId);
+  }
+
+  function canSpeak() {
+    return (
+      typeof window !== "undefined" &&
+      typeof window.speechSynthesis === "object" &&
+      window.speechSynthesis !== null &&
+      typeof window.SpeechSynthesisUtterance === "function"
+    );
+  }
+
+  function bindSpeechVoices() {
+    if (!canSpeak()) {
+      return;
+    }
+
+    const synth = window.speechSynthesis;
+    refreshSpeechVoices();
+
+    // В Chrome и Firefox голоса подгружаются асинхронно: на первом клике
+    // список может быть пустым, поэтому ждём voiceschanged и озвучиваем.
+    synth.onvoiceschanged = function () {
+      refreshSpeechVoices();
+
+      if (!pendingSpeech || !speechVoices.length) {
+        return;
+      }
+
+      const voice = pickEnglishVoice(speechVoices);
+      clearSpeechTimers();
+
+      const utterance = pendingSpeech;
+      pendingSpeech = null;
+
+      if (voice) {
+        utterance.voice = voice;
+        synth.speak(utterance);
+        return;
+      }
+
+      warnMissingEnglishVoice(speechVoices);
+      toast("В системе не найден английский голос", "error");
+    };
+  }
+
+  function refreshSpeechVoices() {
+    if (!canSpeak() || typeof window.speechSynthesis.getVoices !== "function") {
+      return speechVoices;
+    }
+
+    const voices = window.speechSynthesis.getVoices();
+    if (Array.isArray(voices) && voices.length) {
+      speechVoices = voices;
+    }
+    return speechVoices;
+  }
+
+  function clearSpeechTimers() {
+    if (speechTimer) {
+      window.clearTimeout(speechTimer);
+      speechTimer = null;
+    }
+    if (speechFallbackTimer) {
+      window.clearTimeout(speechFallbackTimer);
+      speechFallbackTimer = null;
+    }
+  }
+
+  // Приоритет: en-US → en-GB → любой голос с lang, начинающимся на «en».
+  function pickEnglishVoice(voices) {
+    if (!Array.isArray(voices) || !voices.length) {
+      return null;
+    }
+
+    const entries = voices.map(function (voice) {
+      return {
+        voice: voice,
+        lang: String(voice.lang || "").replace(/_/g, "-").toLowerCase()
+      };
+    });
+
+    const us = entries.find(function (entry) {
+      return entry.lang === "en-us";
+    });
+    if (us) {
+      return us.voice;
+    }
+
+    const gb = entries.find(function (entry) {
+      return entry.lang === "en-gb";
+    });
+    if (gb) {
+      return gb.voice;
+    }
+
+    const anyEnglish = entries.find(function (entry) {
+      return entry.lang.indexOf("en") === 0;
+    });
+    return anyEnglish ? anyEnglish.voice : null;
+  }
+
+  function warnMissingEnglishVoice(voices) {
+    const list = (Array.isArray(voices) ? voices : []).map(function (voice) {
+      return voice.name + " (" + voice.lang + ")";
+    });
+
+    console.warn(
+      "Английский голос не найден. Доступные голоса:",
+      list.length ? list : "список пуст"
+    );
+  }
+
+  function startSpeech(utterance, synth) {
+    const voice = pickEnglishVoice(refreshSpeechVoices());
+
+    if (voice) {
+      utterance.voice = voice;
+      synth.speak(utterance);
+      return;
+    }
+
+    if (!speechVoices.length) {
+      // Голоса ещё не загрузились — дождёмся onvoiceschanged.
+      pendingSpeech = utterance;
+      speechFallbackTimer = window.setTimeout(function () {
+        speechFallbackTimer = null;
+        if (pendingSpeech !== utterance) {
+          return;
+        }
+        pendingSpeech = null;
+        warnMissingEnglishVoice(refreshSpeechVoices());
+        toast("В системе не найден английский голос", "error");
+      }, 1000);
+      return;
+    }
+
+    warnMissingEnglishVoice(speechVoices);
+    toast("В системе не найден английский голос", "error");
+  }
+
+  function speakWithLocalVoice(word) {
+    const text = cleanText(word);
+    if (!text) {
+      return false;
+    }
+
+    if (!canSpeak()) {
+      toast(
+        "Браузер не поддерживает озвучивание речи. Попробуйте Chrome, Edge или Safari.",
+        "error"
+      );
+      return false;
+    }
+
+    const synth = window.speechSynthesis;
+    refreshSpeechVoices();
+    clearSpeechTimers();
+    pendingSpeech = null;
+
+    try {
+      // Перед новой озвучкой всегда останавливаем предыдущую.
+      synth.cancel();
+    } catch (error) {
+      console.warn("Не удалось остановить озвучку:", error);
+    }
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US";
+    utterance.rate = SPEECH_RATE;
+
+    utterance.onerror = function (event) {
+      if (
+        event &&
+        (event.error === "canceled" || event.error === "interrupted")
+      ) {
+        return;
+      }
+      console.warn("Ошибка озвучки:", event && event.error);
+    };
+
+    // Chrome: speak() сразу после cancel() может быть отменён,
+    // поэтому запускаем озвучку с небольшой задержкой.
+    speechTimer = window.setTimeout(function () {
+      speechTimer = null;
+      startSpeech(utterance, synth);
+    }, 50);
+
+    return true;
+  }
+
+  function createSpeakButton(word) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "speak-btn";
+    button.setAttribute("aria-label", "Произнести «" + word + "»");
+    button.title = "Произнести";
+
+    const icon = document.createElement("span");
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = "🔊";
+    button.append(icon);
+
+    button.addEventListener("click", function (event) {
+      // Кнопка находится внутри карточки: не даём клику перевернуть её.
+      event.stopPropagation();
+      speakEnglish(word, button);
+    });
+
+    return button;
+  }
+
+  // Скрытая сторона карточки не должна попадать в Tab-навигацию.
+  function setFaceHidden(face, hidden) {
+    face.setAttribute("aria-hidden", String(hidden));
+    face.querySelectorAll(".speak-btn").forEach(function (button) {
+      button.tabIndex = hidden ? -1 : 0;
+    });
+  }
+
   function createCardFace(kind, badge, word, hint) {
     const face = document.createElement("div");
     face.className = "card__face card__face--" + kind;
@@ -1426,11 +3105,18 @@
     text.className = "card__word";
     text.textContent = word;
 
+    let content = text;
+    if (badge === "EN") {
+      content = document.createElement("span");
+      content.className = "card__word-line";
+      content.append(text, createSpeakButton(word));
+    }
+
     const note = document.createElement("span");
     note.className = "card__hint";
     note.textContent = hint;
 
-    face.append(lang, text, note);
+    face.append(lang, content, note);
     return face;
   }
 
@@ -1490,7 +3176,10 @@
     if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") {
       return;
     }
-    if (event.target.closest(".card__delete")) {
+    if (
+      event.target.closest(".card__delete") ||
+      event.target.closest(".speak-btn")
+    ) {
       return;
     }
     const card = event.target.closest(".card");
@@ -1523,10 +3212,10 @@
     const front = card.querySelector(".card__face--front");
     const back = card.querySelector(".card__face--back");
     if (front) {
-      front.setAttribute("aria-hidden", String(!isFlipped));
+      setFaceHidden(front, !isFlipped);
     }
     if (back) {
-      back.setAttribute("aria-hidden", String(isFlipped));
+      setFaceHidden(back, isFlipped);
     }
 
     const prompt = state.mode === "en" ? word.english : word.russian;
@@ -2000,6 +3689,7 @@
     }
 
     state.words = added.concat(state.words);
+    addWordsToSchedule(added);
     saveWords();
     render();
     els.importDialog.close();
@@ -2019,7 +3709,17 @@
      ========================================================== */
 
   function exportJson() {
-    const data = JSON.stringify(state.words, null, 2);
+    const data = JSON.stringify(
+      {
+        app: "WordFlip",
+        version: 2,
+        exportedAt: new Date().toISOString(),
+        words: state.words,
+        schedule: state.schedule.words
+      },
+      null,
+      2
+    );
     const blob = new Blob([data], { type: "application/json;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -2035,7 +3735,11 @@
     }, 1000);
 
     toast(
-      "Экспортировано " + state.words.length + " " + wordPlural(state.words.length),
+      "Экспортировано " +
+        state.words.length +
+        " " +
+        wordPlural(state.words.length) +
+        " и расписание",
       "success"
     );
   }
@@ -2054,9 +3758,17 @@
           ? data
           : data && Array.isArray(data.words)
             ? data.words
-            : null;
+            : [];
+        const scheduleArray =
+          data && !Array.isArray(data) && data.schedule
+            ? Array.isArray(data.schedule)
+              ? data.schedule
+              : Array.isArray(data.schedule.words)
+                ? data.schedule.words
+                : []
+            : [];
 
-        if (!array) {
+        if (!Array.isArray(data) && !(data && Array.isArray(data.words)) && !scheduleArray.length) {
           throw new Error("Неверный формат файла");
         }
 
@@ -2076,18 +3788,36 @@
           }
         });
 
-        if (!fresh.length) {
-          toast("Все слова из файла уже есть в словаре", "info");
+        const scheduleChanged = scheduleArray.length
+          ? mergeScheduleWords(normalizeScheduleWords(scheduleArray))
+          : 0;
+
+        if (!fresh.length && !scheduleChanged) {
+          toast("Все слова из файла уже есть", "info");
           return;
         }
 
-        state.words = fresh.concat(state.words);
-        saveWords();
+        if (fresh.length) {
+          state.words = fresh.concat(state.words);
+          addWordsToSchedule(fresh, { save: false });
+          saveWords();
+        }
+
+        if (fresh.length || scheduleChanged) {
+          saveSchedule();
+        }
         render();
-        toast(
-          "Импортировано " + fresh.length + " " + wordPlural(fresh.length),
-          "success"
-        );
+
+        const parts = [];
+        if (fresh.length) {
+          parts.push(
+            "добавлено " + fresh.length + " " + wordPlural(fresh.length)
+          );
+        }
+        if (scheduleChanged) {
+          parts.push("расписание обновлено");
+        }
+        toast(parts.join(", "), "success");
       })
       .catch(function (error) {
         console.warn("Ошибка импорта JSON:", error);
@@ -2216,9 +3946,14 @@
     return JSON.stringify(
       {
         app: "WordFlip",
-        version: 1,
+        version: 2,
         updatedAt: updatedAt,
-        words: state.words
+        scheduleUpdatedAt: state.schedule.updatedAt,
+        words: state.words,
+        schedule: {
+          updatedAt: state.schedule.updatedAt,
+          words: state.schedule.words
+        }
       },
       null,
       2
@@ -2272,6 +4007,14 @@
       : data && Array.isArray(data.words)
         ? data.words
         : [];
+    const incomingSchedule =
+      data && !Array.isArray(data) && data.schedule
+        ? Array.isArray(data.schedule)
+          ? data.schedule
+          : Array.isArray(data.schedule.words)
+            ? data.schedule.words
+            : []
+        : [];
 
     const updatedAt =
       Number(data && data.updatedAt) ||
@@ -2280,6 +4023,11 @@
 
     return {
       words: normalizeWordList(incoming),
+      schedule: normalizeScheduleWords(incomingSchedule),
+      scheduleUpdatedAt:
+        Number(data && data.schedule && data.schedule.updatedAt) ||
+        Number(data && data.scheduleUpdatedAt) ||
+        0,
       updatedAt: updatedAt
     };
   }
@@ -2290,6 +4038,19 @@
     state.flipped.clear();
     persistWords();
     saveMeta();
+
+    addWordsToSchedule(state.words, { save: false });
+
+    if (remote.schedule && remote.schedule.length) {
+      mergeScheduleWords(remote.schedule);
+    }
+
+    state.schedule.updatedAt = Math.max(
+      state.schedule.updatedAt,
+      remote.scheduleUpdatedAt || 0
+    );
+    persistSchedule();
+
     render();
   }
 
